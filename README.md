@@ -98,5 +98,5 @@ For questions or support, please open an issue in this repository.
 
 ## License
 
-MIT License © 2025 Prodigees
+MIT License © 2025 
 
