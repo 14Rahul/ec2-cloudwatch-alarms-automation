@@ -1,0 +1,548 @@
+description: |
+  ## AWS CloudWatch Agent Installation and Alarm Configuration
+  This automation document installs the CloudWatch agent on tagged EC2 instances,
+  configures CloudWatch alarms for disk, memory, and CPU utilization metrics,
+  and cleans up alarms for terminated instances.
+schemaVersion: '0.3'
+assumeRole: '{{AutomationAssumeRole}}'
+parameters:
+  TagKey:
+    type: String
+    description: (Required) Target EC2 Instance Tag Key.
+    default: AutoAlarm
+    allowedPattern: ^[A-Za-z0-9_-]*$
+  TagValue:
+    type: String
+    description: (Required) Target EC2 Instance Tag Value.
+    default: 'True'
+    allowedPattern: ^[A-Za-z0-9_-]*$
+  AutomationAssumeRole:
+    type: String
+    description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+    default: ''
+    allowedPattern: ^arn:aws(-cn|-us-gov)?:iam::\d{12}:role\/[\w+=,.@_\/-]+|^$
+  SNSTopicARN:
+    type: String
+    description: |
+      (Optional) The SNS Topic ARN for alarm notifications.
+      To find available topics: AWS Console → SNS → Topics, or use AWS CLI: aws sns list-topics
+      Format: arn:aws:sns:region:account-id:topic-name
+    default: ''
+    allowedPattern: ^arn:aws(-cn|-us-gov)?:sns:[a-z0-9-]+:\d{12}:[\w-]+$|^$
+  Threshold:
+    type: Integer
+    default: 90
+    description: (Required) Threshold Value for Alarms (percentage).
+  Period:
+    type: Integer
+    default: 300
+    description: (Required) The length of time to evaluate the metric (in seconds).
+  TreatMissingData:
+    type: String
+    description: (Required) How to treat missing data when evaluating the alarm.
+    default: breaching
+    allowedValues:
+      - breaching
+      - notBreaching
+      - ignore
+      - missing
+  ComparisonOperator:
+    type: String
+    description: (Required) Define the alarm condition.
+    default: GreaterThanThreshold
+    allowedValues:
+      - GreaterThanOrEqualToThreshold
+      - GreaterThanThreshold
+      - LessThanThreshold
+      - LessThanOrEqualToThreshold
+      - LessThanLowerOrGreaterThanUpperThreshold
+      - LessThanLowerThreshold
+      - GreaterThanUpperThreshold
+  Statistic:
+    type: String
+    description: (Required) Metric data aggregations over specified periods of time.
+    default: Average
+    allowedValues:
+      - Sum
+      - Average
+      - Minimum
+      - Maximum
+      - SampleCount
+mainSteps:
+  - description: |
+      ## Install CWAgent Automation
+    name: InstallCWAgent
+    action: aws:executeScript
+    timeoutSeconds: 20600
+    nextStep: Sleep
+    isCritical: true
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: enable_cw_alarm
+      InputPayload:
+        tagkey: '{{TagKey}}'
+        tagvalue: '{{TagValue}}'
+      Script: |
+        import boto3
+        import time
+
+
+        ec2client = boto3.client('ec2')
+        ssm_client = boto3.client('ssm')
+        client = boto3.client('cloudwatch')
+
+        # Initialize empty list to store all metric alarms
+        all_metric_alarms = []
+
+        # Get all metric alarms using pagination
+        paginator = client.get_paginator('describe_alarms')
+        metric_alarm_iterator = paginator.paginate(AlarmTypes=['MetricAlarm'])
+
+        for page in metric_alarm_iterator:
+            all_metric_alarms.extend(page['MetricAlarms'])
+
+        print(f"Total metric alarms retrieved: {len(all_metric_alarms)}")
+
+        def enable_cw_alarm (event, context):
+            # Initialize the FailedResources list to fix the NameError
+            FailedResources = []
+            SuccessfulResources = []
+            
+            instanceid = []
+            
+            # Get tag parameters from event
+            tag_key = event.get('tagkey', 'AutoAlarm')
+            tag_value = event.get('tagvalue', 'True')
+
+            response = ec2client.describe_instances(
+                Filters=[
+                    {
+                        'Name': f'tag:{tag_key}',
+                        'Values': [
+                            tag_value,
+                        ]
+                    },
+                ]
+            )
+            reservations = response['Reservations']
+            for i in reservations:
+                for j in i['Instances']:
+                    instanceid.append(j['InstanceId'])
+
+            metricName = 'disk_used_percent'
+
+
+            def run_command(instance_ids):
+                print("Installing CW Agent")
+                try: 
+                    ssm_response = ssm_client.send_command(
+                                                    InstanceIds=instance_ids,
+                                                    DocumentName="AWS-ConfigureAWSPackage",
+                                                    Parameters={"action":["Install"], "installationType":["Uninstall and reinstall"], "version":["Latest"],"additionalArguments":["{}"],"name":["AmazonCloudWatchAgent"]},
+                    )     
+                    time.sleep(120)
+                    ssm_response = ssm_client.send_command(
+                                                    InstanceIds=instance_ids,
+                                                    DocumentName="AmazonCloudWatch-ManageAgent",
+                                                    Parameters={"action":["configure"],"mode":["ec2"],"optionalConfigurationSource":["ssm"],"optionalConfigurationLocation":["AmazonCloudWatch-cw-agent-config"],"optionalRestart":["yes"]},
+                    )
+                except Exception as e:
+                    print(f"{e}")
+
+
+            def check_disk_alarm(instance_id):
+
+                # Iterate through metric alarms
+                for alarm in all_metric_alarms:
+                    # Skip alarms without a MetricName
+                    if 'MetricName' not in alarm:
+                        continue
+                        
+                    # Skip alarms without dimensions
+                    if 'Dimensions' not in alarm or len(alarm['Dimensions']) == 0:
+                        continue
+                        
+                    # Check if the alarm is for the specified instance ID and metric 'disk_used_percent'
+                    if alarm['MetricName'] == 'disk_used_percent' and any(d['Name'] == 'InstanceId' and d['Value'] == instance_id for d in alarm['Dimensions']):
+                        print(f"Disk alarm found for instance ID {instance_id}: {alarm['AlarmName']}")
+                        return alarm['Dimensions']
+                
+                return None  # Return None if no matching alarm is found
+
+
+            notalarmid = []
+            for i in instanceid:
+                try:
+                    alarms = check_disk_alarm(i)
+                    print(alarms)
+                    if not alarms:
+                        #run_command(i)
+                        notalarmid.append(i)
+                    else:
+                        print('Already Have alarm')
+                except Exception as e:
+                    # Error handling for undefined variable
+                    FailedResources.append({'resourceARN': i, "error": str(e)})
+                    
+            run_command(notalarmid)
+            print(notalarmid)            
+            # Return the results
+            return {
+                'SuccessfulResources': SuccessfulResources,
+                'FailedResources': FailedResources
+            }
+    outputs:
+      - Name: SuccessfulResources
+        Selector: $.Payload.SuccessfulResources
+        Type: StringList
+      - Name: FailedResources
+        Selector: $.Payload.FailedResources
+        Type: MapList
+  - name: Sleep
+    action: aws:sleep
+    nextStep: CreateAlarm
+    isEnd: false
+    inputs:
+      Duration: PT5M
+  - description: |
+      ## Create CloudWatch Alarm
+    name: CreateAlarm
+    action: aws:executeScript
+    timeoutSeconds: 1600
+    nextStep: DeleteAlarm
+    isCritical: true
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: enable_cw_alarm2
+      InputPayload:
+        tagkey: '{{TagKey}}'
+        tagvalue: '{{TagValue}}'
+        snstopicarn: '{{SNSTopicARN}}'
+        threshold: '{{Threshold}}'
+        period: '{{Period}}'
+        statistic: '{{Statistic}}'
+        comparisonOperator: '{{ComparisonOperator}}'
+        treatmissingdata: '{{TreatMissingData}}'
+      Script: |
+        import boto3
+
+        CWclient = boto3.client('cloudwatch')
+        ec2client = boto3.client('ec2')
+        ec2resource = boto3.resource('ec2')
+        ssm_client = boto3.client('ssm')
+
+        def enable_cw_alarm2 (event, context):
+            FailedResources = []
+            SuccessResources = []
+            
+            # Get parameters from event
+            tag_key = event.get('tagkey', 'AutoAlarm')
+            tag_value = event.get('tagvalue', 'True')
+            sns_topic_arn = event.get('snstopicarn', '')
+            ComparisonOperator = event.get('comparisonOperator', 'GreaterThanThreshold')
+            Period = int(event.get('period', 300))
+            Statistic = event.get('statistic', 'Average')
+            Threshold = float(event.get('threshold', 90.0))
+            treat_missing_data = event.get('treatmissingdata', 'breaching')
+            metricName = ['disk_used_percent', 'mem_used_percent', 'CPUUtilization']
+            namespace = 'CWAgent'
+
+            instancename = []
+            resourceArns = []
+            instanceid = []
+            instancetype = []
+            
+            # Get account ID and region from AWS STS
+            sts_client = boto3.client('sts')
+            caller_identity = sts_client.get_caller_identity()
+            account_id = caller_identity['Account']
+            
+            # Extract region from ARN
+            arn = caller_identity['Arn']
+            region = arn.split(':')[3]
+
+            response = ec2client.describe_instances(
+                Filters=[
+                    {
+                        'Name': f'tag:{tag_key}',
+                        'Values': [
+                            tag_value,
+                        ]
+                    },
+                ]
+            )
+            reservations = response['Reservations']
+            for i in reservations:
+                for j in i['Instances']:
+                    instance_arn = f'arn:aws:ec2:{region}:{account_id}:instance/{j["InstanceId"]}'
+                    print(instance_arn)
+                    resourceArns.append(instance_arn)
+                    instancetype.append(j['InstanceType'])
+                    instanceid.append(j['InstanceId'])
+                    for k in j['Tags']:
+                        if k['Key'] == 'Name':
+                            instancename.append(k['Value'])
+
+
+            #print(reservations)
+
+
+            # Get list of available metrics for CWAgent namespace
+            response = CWclient.list_metrics(Namespace=namespace)
+
+            # Initialize dictionary to store metrics for each instance
+            instance_metrics = {}
+
+            # Extract and organize metrics by instance ID
+            for metric in response['Metrics']:
+                instance_id = None
+                for dimension in metric['Dimensions']:
+                    if dimension['Name'] == 'InstanceId':
+                        instance_id = dimension['Value']
+                        break
+                
+                if instance_id:
+                    metric_info = {
+                        'MetricName': metric['MetricName'],
+                        'Dimensions': metric['Dimensions']
+                    }
+                    
+                    if instance_id not in instance_metrics:
+                        instance_metrics[instance_id] = []
+                    
+                    instance_metrics[instance_id].append(metric_info)
+
+            #print(instance_metrics)
+
+            def create_CW_alarm_agent (metricsData, ComparisonOperator, Period, Statistic, Threshold, Name, sns_arn, treat_missing):
+                if metricsData['MetricName'] == 'disk_used_percent':
+                    # Fix potential index error by safely checking dimension value
+                    path_value = ''
+                    for dim in metricsData['Dimensions']:
+                        if dim['Name'] == 'path':
+                            path_value = dim['Value']
+                            break
+                            
+                    if path_value == '/':
+                        alarm_config = {
+                            'AlarmName': f'US {Name} {metricsData["MetricName"]} /root {Threshold}% Utilisation',
+                            'ComparisonOperator': ComparisonOperator,
+                            'ActionsEnabled': True,
+                            'EvaluationPeriods': 1,
+                            'MetricName': metricsData['MetricName'],
+                            'Namespace': 'CWAgent',
+                            'Period': Period,
+                            'Statistic': Statistic,
+                            'Threshold': Threshold,
+                            'AlarmDescription': f'Cloudwatch alarm for ({Name}) with metricName {metricsData["MetricName"]}',
+                            'Dimensions': metricsData['Dimensions'],
+                            'TreatMissingData': treat_missing
+                        }
+                        if sns_arn:
+                            alarm_config['OKActions'] = [sns_arn]
+                            alarm_config['AlarmActions'] = [sns_arn]
+                        CWclient.put_metric_alarm(**alarm_config)
+                    else:
+                        alarm_config = {
+                            'AlarmName': f'US {Name} {metricsData["MetricName"]} {path_value} {Threshold}% Utilisation',
+                            'ComparisonOperator': ComparisonOperator,
+                            'ActionsEnabled': True,
+                            'EvaluationPeriods': 1,
+                            'MetricName': metricsData['MetricName'],
+                            'Namespace': 'CWAgent',
+                            'Period': Period,
+                            'Statistic': Statistic,
+                            'Threshold': Threshold,
+                            'AlarmDescription': f'Cloudwatch alarm for ({Name}) with metricName {metricsData["MetricName"]}',
+                            'Dimensions': metricsData['Dimensions'],
+                            'TreatMissingData': treat_missing
+                        }
+                        if sns_arn:
+                            alarm_config['OKActions'] = [sns_arn]
+                            alarm_config['AlarmActions'] = [sns_arn]
+                        CWclient.put_metric_alarm(**alarm_config)
+                else:
+                    alarm_config = {
+                        'AlarmName': f'US {Name} {metricsData["MetricName"]} {Threshold}% Utilisation',
+                        'ComparisonOperator': ComparisonOperator,
+                        'ActionsEnabled': True,
+                        'EvaluationPeriods': 1,
+                        'MetricName': metricsData['MetricName'],
+                        'Namespace': 'CWAgent',
+                        'Period': Period,
+                        'Statistic': Statistic,
+                        'Threshold': Threshold,
+                        'AlarmDescription': f'Cloudwatch alarm for ({Name}) with metricName {metricsData["MetricName"]}',
+                        'Dimensions': metricsData['Dimensions'],
+                        'TreatMissingData': treat_missing
+                    }
+                    if sns_arn:
+                        alarm_config['OKActions'] = [sns_arn]
+                        alarm_config['AlarmActions'] = [sns_arn]
+                    CWclient.put_metric_alarm(**alarm_config)
+
+            for i, n, it in zip(instanceid, instancename, instancetype) :
+                for instance_id, metrics in instance_metrics.items():
+                    if instance_id == i:
+                        print(metrics)
+                        for m in metrics:
+                            c = -1
+                            for t in m['Dimensions']:
+                                c+=1
+                                if t['Name'] == 'InstanceType':
+                                    m['Dimensions'][c]['Value'] = it
+                                    print(m['Dimensions'][c]['Value'])
+                            if m['MetricName'] == 'disk_used_percent': # && m['Dimensions'][1]['Value'] == i:
+                                print("Disk Dimention" +' - ')
+                                print(m['Dimensions'])
+                                create_CW_alarm_agent(m, ComparisonOperator, Period, Statistic, Threshold, n, sns_topic_arn, treat_missing_data)
+                            if m['MetricName'] == 'mem_used_percent': # && m['Dimensions'][0]['Value'] == i:
+                                print("Memory Dimention" +' - ')
+                                print(m['Dimensions'])
+                                create_CW_alarm_agent(m, ComparisonOperator, Period, Statistic, Threshold, n, sns_topic_arn, treat_missing_data)
+
+
+            #CPU Utilization
+
+            def create_CW_alarm_cpu (alarmData, metricName, ComparisonOperator, Period, Statistic, Threshold, Name, sns_arn, treat_missing):
+                alarm_config = {
+                    'AlarmName': f'US {Name} {metricName} {Threshold}% Utilisation',
+                    'ComparisonOperator': ComparisonOperator,
+                    'ActionsEnabled': True,
+                    'EvaluationPeriods': 1,
+                    'MetricName': metricName,
+                    'Namespace': alarmData['namespace'],
+                    'Period': Period,
+                    'Statistic': Statistic,
+                    'Threshold': Threshold,
+                    'AlarmDescription': f'Cloudwatch alarm for ({alarmData["identifier"]}) with metricName {metricName}',
+                    'Dimensions': alarmData['Dimensions'],
+                    'TreatMissingData': treat_missing
+                }
+                if sns_arn:
+                    alarm_config['OKActions'] = [sns_arn]
+                    alarm_config['AlarmActions'] = [sns_arn]
+                CWclient.put_metric_alarm(**alarm_config)
+
+            def get_alarm_data(resourceArn):
+                splittedArn = resourceArn.split(':')
+                service = splittedArn[2]
+                if service.lower() == "ec2".lower():
+                    ec2resource = splittedArn[5].split("/")
+                    if ec2resource[0].lower() == "volume":
+                        alarm_var = {
+                            "identifier": ec2resource[1],
+                            "namespace": "AWS/EBS",
+                            "Dimensions": [
+                                {
+                                    'Name': 'VolumeId',
+                                    'Value': ec2resource[1]
+                                }
+                            ]
+                        }
+                    elif ec2resource[0].lower() == "instance":
+                        alarm_var = {
+                            "identifier": ec2resource[1],
+                            "namespace": "AWS/EC2",
+                            "Dimensions": [
+                                {
+                                    'Name': 'InstanceId',
+                                    'Value': ec2resource[1]
+                                }
+                            ]
+                        }
+                    return alarm_var
+                else:
+                    raise Exception("Service '{}' not supported.".format(service))
+
+
+            for arn, n in zip(resourceArns, instancename):
+                cpumetrics = 'CPUUtilization'
+                alarmData = get_alarm_data(arn)
+                create_CW_alarm_cpu(alarmData, cpumetrics, ComparisonOperator, Period, Statistic, Threshold, n, sns_topic_arn, treat_missing_data)
+                
+            # Return the results
+            return {
+                'SuccessfulResources': SuccessResources,
+                'FailedResources': FailedResources
+            }
+    outputs:
+      - Name: SuccessfulResources
+        Selector: $.Payload.SuccessfulResources
+        Type: StringList
+      - Name: FailedResources
+        Selector: $.Payload.FailedResources
+        Type: MapList
+  - description: |
+      ## Deleting CloudWatch Alarm
+    name: DeleteAlarm
+    action: aws:executeScript
+    timeoutSeconds: 1600
+    isCritical: true
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: enable_cw_alarm3
+      Script: |
+        import boto3
+
+        def enable_cw_alarm3 (event, context):
+            # Initialize return lists
+            FailedResources = []
+            SuccessfulResources = []
+
+            def get_instance_ids():
+                ec2 = boto3.client('ec2')
+                response = ec2.describe_instances()
+                instance_ids = [instance['InstanceId'] for reservation in response['Reservations'] for instance in reservation['Instances'] if instance['State']['Name'] != 'terminated']
+                print(instance_ids)
+                return instance_ids
+
+            def get_alarms_for_instances(instance_ids):
+                cloudwatch = boto3.client('cloudwatch')
+                all_alarms = []
+                paginator = cloudwatch.get_paginator('describe_alarms')
+                for page in paginator.paginate():
+                    all_alarms.extend(page['MetricAlarms'])
+
+                alarms_to_delete = []
+                
+                for alarm in all_alarms:
+                    for dimension in alarm['Dimensions']:
+                        if dimension['Name'] == 'InstanceId' and dimension['Value'] not in instance_ids:
+                            alarms_to_delete.append(alarm['AlarmName'])
+                            break
+                
+                return alarms_to_delete
+
+            def delete_alarms(alarms):
+                cloudwatch = boto3.client('cloudwatch')
+                for alarm in alarms:
+                    print(f"Deleting alarm: {alarm}")
+                    cloudwatch.delete_alarms(AlarmNames=[alarm])
+
+            #if __name__ == "__main__":
+            instance_ids = get_instance_ids()
+            alarms_to_delete = get_alarms_for_instances(instance_ids)
+            
+            if alarms_to_delete:
+                print("Deleting alarms associated with non-existing instances...")
+                delete_alarms(alarms_to_delete)
+                SuccessfulResources.extend(alarms_to_delete)
+            else:
+                print("No alarms found associated with non-existing instances.")
+                
+            # Return the results
+            return {
+                'SuccessfulResources': SuccessfulResources,
+                'FailedResources': FailedResources
+            }
+    outputs:
+      - Name: SuccessfulResources
+        Selector: $.Payload.SuccessfulResources
+        Type: StringList
+      - Name: FailedResources
+        Selector: $.Payload.FailedResources
+        Type: MapList
